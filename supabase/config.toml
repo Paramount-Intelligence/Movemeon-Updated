@@ -1,0 +1,10 @@
+# Minimal Supabase CLI config for schema migrations.
+# Link with: supabase link --project-ref <SUPABASE_PROJECT_REF>
+
+project_id = "catalant-monitor"
+
+[api]
+enabled = true
+
+[db]
+major_version = 15

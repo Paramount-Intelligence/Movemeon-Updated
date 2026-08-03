@@ -45,4 +45,4 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY . .
 
-CMD ["python", "-u", "movemeon_monitor.py"]
+CMD ["python", "-u", "monitor.py"]

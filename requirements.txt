@@ -1,12 +1,11 @@
 # Selenium for web automation
-selenium>=4.15.0
+selenium>=4.15.0,<5
 
 # Environment variable management
 python-dotenv>=1.0.0
 
-# MongoDB driver (Atlas cloud DB)
-pymongo>=4.0.0
-dnspython>=2.0.0
+# Shared Supabase project (same as Catalant / BTG) — production persistence
+supabase>=2.8.0,<3
 
 # Note: Chromium and ChromeDriver are installed via apt in the Dockerfile
 # (chromium + chromium-driver packages) — no webdriver-manager needed

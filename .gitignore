@@ -56,3 +56,12 @@ script_test.py
 
 cookie_session_failed.png
 cookie_session_failed.html
+movemeon_login_failed.png
+movemeon_login_failed.html
+movemeon_inspect_*.png
+movemeon_inspect_*.html
+movemeon_live_inspect_*.png
+movemeon_live_inspect_*.html
+*.png
+*.html
+!README.md

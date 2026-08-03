@@ -1,29 +1,26 @@
-import os
-from pymongo import MongoClient
-from dotenv import load_dotenv
+"""
+DEPRECATED: MoveMeOn no longer uses MongoDB.
 
-load_dotenv()
+Database schema and indexes are managed in Supabase. Apply migrations under
+supabase/migrations/ and verify with:
 
-MONGO_URI = os.getenv("MONGO_URI")
-DB_NAME = "office_monitor"
-COLLECTION_NAME = "movemeon_projects"
+  python monitor.py --test-supabase
 
-def init_mongo():
-    try:
-        client = MongoClient(MONGO_URI)
-        db = client[DB_NAME]
-        
-        # Collections are created automatically, but we'll ensure it exists and create the index
-        if COLLECTION_NAME not in db.list_collection_names():
-            print(f"Creating collection: {COLLECTION_NAME}")
-            db.create_collection(COLLECTION_NAME)
-        
-        print(f"Ensuring index on project_id for {COLLECTION_NAME}")
-        db[COLLECTION_NAME].create_index("project_id", unique=True)
-        print("MongoDB initialization successful.")
-        client.close()
-    except Exception as e:
-        print(f"MongoDB initialization failed: {e}")
+This stub remains so legacy deploy steps that call init_db_movemeon.py exit
+successfully without creating Mongo indexes.
+"""
+
+from __future__ import annotations
+
+
+def main() -> int:
+    print(
+        "init_db_movemeon.py is deprecated: MoveMeOn uses Supabase, not MongoDB.\n"
+        "Apply supabase/migrations/*.sql in the Supabase SQL editor, then run:\n"
+        "  python monitor.py --test-supabase"
+    )
+    return 0
+
 
 if __name__ == "__main__":
-    init_mongo()
+    raise SystemExit(main())
