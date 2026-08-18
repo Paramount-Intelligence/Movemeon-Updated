@@ -186,6 +186,102 @@ class CLIArgsTests(unittest.TestCase):
         self.assertTrue(args.dry_run)
 
 
+class BrowserCrashRecoveryTests(unittest.TestCase):
+    def test_tab_crashed_is_dead_session(self):
+        self.assertTrue(sc.is_browser_session_dead(Exception("Message: tab crashed")))
+
+    def test_invalid_session_is_dead(self):
+        self.assertTrue(sc.is_browser_session_dead(Exception("invalid session id")))
+
+    def test_chrome_not_reachable_is_dead(self):
+        self.assertTrue(sc.is_browser_session_dead(Exception("chrome not reachable")))
+
+    def test_generic_scan_error_is_not_dead(self):
+        self.assertFalse(sc.is_browser_session_dead(Exception("Timeout waiting for job cards")))
+
+    def test_cmd_run_monitor_retries_same_day_then_sleeps_after_success(self):
+        crash = Exception("Message: tab crashed\n  (Session info: chrome=151.0.7922.108)")
+        calls = {"scan": 0}
+
+        def fake_scan(*_a, **_k):
+            calls["scan"] += 1
+            if calls["scan"] == 1:
+                raise crash
+
+        fake_driver = mock.MagicMock()
+        with mock.patch.object(sc, "start_health_server"), \
+             mock.patch.object(sc.WorkerLockGuard, "acquire"), \
+             mock.patch.object(sc.WorkerLockGuard, "maybe_renew", return_value=True), \
+             mock.patch.object(sc.WorkerLockGuard, "release"), \
+             mock.patch.object(sc, "initialize_driver", return_value=fake_driver), \
+             mock.patch.object(sc, "setup_session", return_value=True), \
+             mock.patch.object(sc, "run_scrape_cycle", side_effect=fake_scan), \
+             mock.patch.object(sc, "recreate_browser_session", return_value=fake_driver) as mock_recreate, \
+             mock.patch.object(sc, "sleep_until_next_run", side_effect=KeyboardInterrupt), \
+             mock.patch.object(sc.Config, "SCAN_CRASH_MAX_RETRIES", 3), \
+             mock.patch.object(sc.Config, "SCAN_CRASH_RETRY_SECONDS", 0), \
+             mock.patch.object(sc.time, "sleep"):
+            with self.assertRaises(KeyboardInterrupt):
+                sc._cmd_run_monitor(
+                    run_once=False, test_details=False, dry_run=True, debug_extraction=False
+                )
+
+        self.assertEqual(calls["scan"], 2)
+        self.assertTrue(mock_recreate.called)
+
+    def test_cmd_run_monitor_run_once_does_not_sleep_after_crash_retry_success(self):
+        crash = Exception("Message: tab crashed")
+        calls = {"scan": 0}
+
+        def fake_scan(*_a, **_k):
+            calls["scan"] += 1
+            if calls["scan"] == 1:
+                raise crash
+
+        fake_driver = mock.MagicMock()
+        with mock.patch.object(sc, "start_health_server"), \
+             mock.patch.object(sc.WorkerLockGuard, "acquire"), \
+             mock.patch.object(sc.WorkerLockGuard, "maybe_renew", return_value=True), \
+             mock.patch.object(sc.WorkerLockGuard, "release"), \
+             mock.patch.object(sc, "initialize_driver", return_value=fake_driver), \
+             mock.patch.object(sc, "setup_session", return_value=True), \
+             mock.patch.object(sc, "run_scrape_cycle", side_effect=fake_scan), \
+             mock.patch.object(sc, "recreate_browser_session", return_value=fake_driver), \
+             mock.patch.object(sc, "sleep_until_next_run") as mock_sleep, \
+             mock.patch.object(sc.Config, "SCAN_CRASH_MAX_RETRIES", 3), \
+             mock.patch.object(sc.Config, "SCAN_CRASH_RETRY_SECONDS", 0), \
+             mock.patch.object(sc.time, "sleep"):
+            rc = sc._cmd_run_monitor(
+                run_once=True, test_details=False, dry_run=True, debug_extraction=False
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls["scan"], 2)
+        mock_sleep.assert_not_called()
+
+    def test_cmd_run_monitor_exits_nonzero_when_retries_exhausted(self):
+        crash = Exception("Message: tab crashed")
+        fake_driver = mock.MagicMock()
+        with mock.patch.object(sc, "start_health_server"), \
+             mock.patch.object(sc.WorkerLockGuard, "acquire"), \
+             mock.patch.object(sc.WorkerLockGuard, "maybe_renew", return_value=True), \
+             mock.patch.object(sc.WorkerLockGuard, "release"), \
+             mock.patch.object(sc, "initialize_driver", return_value=fake_driver), \
+             mock.patch.object(sc, "setup_session", return_value=True), \
+             mock.patch.object(sc, "run_scrape_cycle", side_effect=crash), \
+             mock.patch.object(sc, "recreate_browser_session", return_value=fake_driver), \
+             mock.patch.object(sc, "sleep_until_next_run") as mock_sleep, \
+             mock.patch.object(sc.Config, "SCAN_CRASH_MAX_RETRIES", 2), \
+             mock.patch.object(sc.Config, "SCAN_CRASH_RETRY_SECONDS", 0), \
+             mock.patch.object(sc.time, "sleep"):
+            rc = sc._cmd_run_monitor(
+                run_once=True, test_details=False, dry_run=True, debug_extraction=False
+            )
+
+        self.assertEqual(rc, 1)
+        mock_sleep.assert_not_called()
+
+
 class CategoryNotExposedNoPartialTests(unittest.TestCase):
     """Category NOT_EXPOSED must never, by itself, count as a real failure / PARTIAL."""
 

@@ -51,7 +51,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from dotenv import load_dotenv
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -142,6 +142,10 @@ class Config:
     # --- Worker lock (single-writer guarantee across replicas) ---
     WORKER_LOCK_ENABLED = _env_bool("WORKER_LOCK_ENABLED", "true")
     WORKER_LOCK_TTL_SECONDS = _env_int("WORKER_LOCK_TTL_SECONDS", 180)
+
+    # --- Same-day recovery after Chrome/tab crashes ---
+    SCAN_CRASH_MAX_RETRIES = _env_int("SCAN_CRASH_MAX_RETRIES", 3)
+    SCAN_CRASH_RETRY_SECONDS = _env_int("SCAN_CRASH_RETRY_SECONDS", 45)
 
     # --- Session cache ---
     COOKIES_FILE = os.getenv("COOKIE_FILE", "movemeon_cookies.json")
@@ -1510,7 +1514,9 @@ def initialize_driver():
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-software-rasterizer")
-    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--renderer-process-limit=1")
+    options.add_argument("--js-flags=--max-old-space-size=256")
+    options.add_argument("--window-size=1280,720")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
@@ -1519,6 +1525,57 @@ def initialize_driver():
     driver = webdriver.Chrome(service=service, options=options)
     driver.execute_cdp_cmd("Network.setUserAgentOverride", {"userAgent": USER_AGENT})
     return driver
+
+
+BROWSER_CRASH_TOKENS = (
+    "tab crashed",
+    "chrome not reachable",
+    "disconnected",
+    "invalid session id",
+    "session deleted",
+    "session not created",
+    "unable to discover open pages",
+    "renderer",
+    "chrome failed to start",
+    "cannot connect to chrome",
+    "no such window",
+    "web view not found",
+    "target window already closed",
+)
+
+
+def is_browser_session_dead(exc: BaseException) -> bool:
+    """True when Chrome/Selenium can no longer be reused and must be recreated."""
+    if isinstance(exc, WebDriverException):
+        text = f"{type(exc).__name__} {exc}".lower()
+        return any(tok in text for tok in BROWSER_CRASH_TOKENS)
+    text = str(exc or "").lower()
+    return any(tok in text for tok in BROWSER_CRASH_TOKENS)
+
+
+def _safe_quit_driver(driver) -> None:
+    if driver is None:
+        return
+    try:
+        driver.quit()
+    except Exception:
+        pass
+
+
+def recreate_browser_session(driver):
+    """
+    Kill the current Chrome process and start a fresh authenticated session.
+    Used after a tab crash and before each new daily scan so memory cannot accumulate overnight.
+    """
+    print("  Recreating Chrome session...")
+    _safe_quit_driver(driver)
+    time.sleep(2)
+    new_driver = initialize_driver()
+    if not setup_session(new_driver):
+        _safe_quit_driver(new_driver)
+        raise RuntimeError("Failed to re-establish MoveMeOn session after Chrome restart")
+    print("  Chrome session recreated.")
+    return new_driver
 
 
 # ---------------------------------------------------------------------------
@@ -2029,7 +2086,7 @@ def _cmd_run_monitor(*, run_once: bool, test_details: bool, dry_run: bool, debug
         enabled=Config.WORKER_LOCK_ENABLED, allow_missing_schema=dry_run,
     )
 
-    driver = initialize_driver()
+    driver = None
     try:
         try:
             lock.acquire()
@@ -2037,6 +2094,7 @@ def _cmd_run_monitor(*, run_once: bool, test_details: bool, dry_run: bool, debug
             print(f"WORKER LOCK ERROR: {exc}")
             return 1
 
+        driver = initialize_driver()
         if not setup_session(driver):
             print(
                 "❌ Failed to establish a session. Check movemeon_login_failed.png/html "
@@ -2052,20 +2110,70 @@ def _cmd_run_monitor(*, run_once: bool, test_details: bool, dry_run: bool, debug
             print(f"🔄 Check #{check_count} - {datetime.now(PKT).strftime('%Y-%m-%d %H:%M:%S')} PKT")
             print("=" * 30)
 
-            try:
-                run_scrape_cycle(
-                    driver,
-                    dry_run=dry_run,
-                    debug_extraction=debug_extraction,
-                    test_details=test_details and check_count == 1,
-                    lock=lock,
-                )
-            except Exception as exc:
-                print(f"⚠️ Scan cycle failed: {_redact(exc)} — will retry at the next scheduled run.")
+            # Fresh Chrome each scheduled day after the first — overnight memory
+            # growth is the usual cause of "tab crashed".
+            if check_count > 1:
+                try:
+                    driver = recreate_browser_session(driver)
+                except Exception as rec_exc:
+                    print(f"❌ Could not recreate Chrome before scan: {_redact(rec_exc)}")
+                    return 1
+
+            max_attempts = max(int(Config.SCAN_CRASH_MAX_RETRIES), 1)
+            scan_ok = False
+            last_error: Optional[BaseException] = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    run_scrape_cycle(
+                        driver,
+                        dry_run=dry_run,
+                        debug_extraction=debug_extraction,
+                        test_details=test_details and check_count == 1 and attempt == 1,
+                        lock=lock,
+                    )
+                    scan_ok = True
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    crashed = is_browser_session_dead(exc)
+                    print(f"  Scan cycle error: {_redact(exc)}")
+                    if crashed and attempt < max_attempts:
+                        print(
+                            f"⚠️ Chrome session died (attempt {attempt}/{max_attempts}). "
+                            f"Restarting browser and retrying this scan now "
+                            f"(not waiting until tomorrow)."
+                        )
+                        try:
+                            driver = recreate_browser_session(driver)
+                        except Exception as rec_exc:
+                            print(f"❌ Chrome restart failed: {_redact(rec_exc)}")
+                            return 1
+                        time.sleep(max(int(Config.SCAN_CRASH_RETRY_SECONDS), 0))
+                        continue
+                    print(
+                        f"⚠️ Scan cycle failed: {_redact(exc)}"
+                        + (
+                            " — same-day retries exhausted."
+                            if crashed
+                            else " — will retry at the next scheduled run."
+                        )
+                    )
+                    break
 
             if run_once:
                 print("\n✅ Run-once complete. Exiting.")
-                break
+                return 0 if scan_ok else 1
+
+            if not scan_ok:
+                # Exit so Railway ON_FAILURE restarts the container. Startup
+                # runs a scan immediately, which resumes the same day's work.
+                print(
+                    "❌ Scan did not complete. Exiting so the platform can restart "
+                    "the process and retry without waiting 24 hours."
+                )
+                if last_error is not None:
+                    print(f"   Last error: {_redact(last_error)}")
+                return 1
 
             lock.maybe_renew()
             sleep_until_next_run()
@@ -2073,10 +2181,7 @@ def _cmd_run_monitor(*, run_once: bool, test_details: bool, dry_run: bool, debug
         return 0
     finally:
         lock.release()
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        _safe_quit_driver(driver)
 
 
 # ---------------------------------------------------------------------------
