@@ -167,6 +167,10 @@ class Config:
     SCAN_CRASH_MAX_RETRIES = _env_int("SCAN_CRASH_MAX_RETRIES", 3)
     SCAN_CRASH_RETRY_SECONDS = _env_int("SCAN_CRASH_RETRY_SECONDS", 45)
 
+    # Delay before exiting on session/login failure so Railway ON_FAILURE
+    # does not crash-loop every ~1 minute and flood ERROR_RECIPIENT.
+    SESSION_FAIL_EXIT_DELAY_SECONDS = _env_int("SESSION_FAIL_EXIT_DELAY_SECONDS", 600)
+
     # --- Session cache ---
     COOKIES_FILE = os.getenv("COOKIE_FILE", "movemeon_cookies.json")
 
@@ -566,39 +570,103 @@ def _click_visible_by_texts(
         return False
     end = time.time() + max(timeout, 1)
     while time.time() < end:
-        for text in lowered:
-            xpaths = (
-                f"//button[contains(translate(normalize-space(.),"
-                f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{text}')]",
-                f"//a[contains(translate(normalize-space(.),"
-                f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{text}')]",
-                f"//*[@role='button' and contains(translate(normalize-space(.),"
-                f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{text}')]",
-                f"//span[contains(translate(normalize-space(.),"
-                f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{text}')]/parent::button",
-                f"//span[contains(translate(normalize-space(.),"
-                f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{text}')]/parent::a",
+        # Prefer a broad DOM scan — MoveMeOn nests labels in spans/divs.
+        try:
+            candidates = driver.find_elements(
+                By.XPATH,
+                "//button|//a|//*[@role='button']|//span|//div|//p|//label",
             )
-            for xpath in xpaths:
-                try:
-                    for elem in driver.find_elements(By.XPATH, xpath):
-                        if not elem.is_displayed():
-                            continue
-                        label = (elem.text or "").strip().lower()
-                        if not label:
-                            continue
-                        if any(ex in label for ex in excluded):
-                            continue
-                        if exact and label != text:
-                            continue
-                        if not exact and text not in label:
-                            continue
-                        driver.execute_script("arguments[0].click();", elem)
-                        return True
-                except Exception:
+        except Exception:
+            candidates = []
+        for elem in candidates:
+            try:
+                if not elem.is_displayed():
                     continue
+                label = (elem.text or "").strip().lower()
+                if not label:
+                    label = (elem.get_attribute("aria-label") or "").strip().lower()
+                if not label:
+                    continue
+                if any(ex in label for ex in excluded):
+                    continue
+                matched = False
+                for text in lowered:
+                    if exact and label == text:
+                        matched = True
+                        break
+                    if not exact and text in label:
+                        matched = True
+                        break
+                if not matched:
+                    continue
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'}); arguments[0].click();",
+                    elem,
+                )
+                return True
+            except Exception:
+                continue
         time.sleep(0.4)
     return False
+
+
+def _set_input_value(driver, elem, value: str) -> None:
+    """Set an input value reliably for React/Clerk controlled fields."""
+    try:
+        elem.click()
+    except Exception:
+        pass
+    try:
+        elem.clear()
+    except Exception:
+        pass
+    try:
+        elem.send_keys(Keys.CONTROL, "a")
+        elem.send_keys(Keys.BACK_SPACE)
+    except Exception:
+        pass
+    elem.send_keys(value)
+    # Ensure frameworks that listen for input events see the final value.
+    try:
+        driver.execute_script(
+            """
+            const el = arguments[0];
+            const val = arguments[1];
+            el.value = val;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            """,
+            elem,
+            value,
+        )
+    except Exception:
+        pass
+
+
+def _log_auth_controls(driver, label: str = "auth") -> None:
+    """Print visible auth control labels to help diagnose login UI changes."""
+    try:
+        labels = []
+        for elem in driver.find_elements(
+            By.XPATH, "//button|//a|//*[@role='button']|//input"
+        ):
+            try:
+                if not elem.is_displayed():
+                    continue
+                text = (elem.text or "").strip()
+                aria = (elem.get_attribute("aria-label") or "").strip()
+                typ = (elem.get_attribute("type") or "").strip()
+                name = (elem.get_attribute("name") or "").strip()
+                placeholder = (elem.get_attribute("placeholder") or "").strip()
+                bit = text or aria or " ".join(x for x in (typ, name, placeholder) if x)
+                if bit:
+                    labels.append(bit[:80])
+            except Exception:
+                continue
+        if labels:
+            print(f"  [{label}] Visible controls: {labels[:20]}")
+    except Exception as exc:
+        print(f"  [{label}] Could not list controls: {type(exc).__name__}")
 
 
 def _clear_browser_auth_state(driver) -> None:
@@ -654,7 +722,7 @@ def _navigate_to_search(driver) -> None:
 
 
 def perform_login(driver) -> bool:
-    """MoveMeOn login: email → choose password method → password → dashboard."""
+    """MoveMeOn login: choose password method, then email+password → dashboard."""
     try:
         # Stale cookies often leave the sign-in page in a half-auth state
         # ("Already have an account? Log out") with no password field.
@@ -666,11 +734,13 @@ def perform_login(driver) -> bool:
             driver.maximize_window()
         except Exception:
             pass
-        time.sleep(3)
+        time.sleep(4)
 
         if "dashboard" in (driver.current_url or ""):
             print("  Already logged in.")
             return True
+
+        _log_auth_controls(driver, "signin")
 
         # Clear residual "Log out" / half-session UI before filling credentials.
         if _click_visible_by_texts(driver, ["log out", "logout", "sign out"], timeout=3):
@@ -678,7 +748,19 @@ def perform_login(driver) -> bool:
             time.sleep(2)
             _clear_browser_auth_state(driver)
             driver.get("https://portal.movemeon.com/auth/signin")
-            time.sleep(3)
+            time.sleep(4)
+            _log_auth_controls(driver, "signin-after-logout")
+
+        # Current MoveMeOn UI often shows method chooser first:
+        # Google / magic link / "Log in with password".
+        if _click_visible_by_texts(
+            driver,
+            ["log in with password", "login with password", "use password"],
+            timeout=10,
+            exclude_texts=["google", "magic"],
+        ):
+            print("  Selected 'Log in with password' (before credentials).")
+            time.sleep(2)
 
         print(f"  Entering email: {Config.EMAIL}...")
         email_field = _find_visible_input(
@@ -687,32 +769,47 @@ def perform_login(driver) -> bool:
                 "input[type='email']",
                 "input[name*='email' i]",
                 "input[placeholder*='email' i]",
+                "input[autocomplete='username']",
+                "input[autocomplete='email']",
                 "#email",
             ],
+            timeout=25,
         )
-        email_field.clear()
-        email_field.send_keys(Config.EMAIL)
+        _set_input_value(driver, email_field, Config.EMAIL)
 
-        # Some flows need Continue/Next; ENTER alone is not always enough.
-        # Never click Google / magic-link buttons here.
-        if not _click_visible_by_texts(
-            driver,
-            ["continue", "next"],
-            timeout=3,
-            exclude_texts=["google", "magic"],
-        ):
-            email_field.send_keys(Keys.ENTER)
-        time.sleep(2)
+        # If password field is not visible yet, advance the form / choose password again.
+        password_ready = False
+        try:
+            for sel in ("input[type='password']", "input[name*='password' i]", "#password"):
+                for elem in driver.find_elements(By.CSS_SELECTOR, sel):
+                    if elem.is_displayed():
+                        password_ready = True
+                        break
+                if password_ready:
+                    break
+        except Exception:
+            password_ready = False
 
-        # Current MoveMeOn UI shows a method chooser before the password input.
-        if _click_visible_by_texts(
-            driver,
-            ["log in with password", "login with password", "use password"],
-            timeout=8,
-            exclude_texts=["google", "magic"],
-        ):
-            print("  Selected 'Log in with password'.")
+        if not password_ready:
+            if not _click_visible_by_texts(
+                driver,
+                ["continue", "next"],
+                timeout=3,
+                exclude_texts=["google", "magic", "password"],
+            ):
+                try:
+                    email_field.send_keys(Keys.ENTER)
+                except Exception:
+                    pass
             time.sleep(2)
+            if _click_visible_by_texts(
+                driver,
+                ["log in with password", "login with password", "use password"],
+                timeout=8,
+                exclude_texts=["google", "magic"],
+            ):
+                print("  Selected 'Log in with password' (after email).")
+                time.sleep(2)
 
         print("  Waiting for password field...")
         password_field = _find_visible_input(
@@ -721,25 +818,26 @@ def perform_login(driver) -> bool:
                 "input[type='password']",
                 "input[name*='password' i]",
                 "input[placeholder*='password' i]",
+                "input[autocomplete='current-password']",
                 "#password",
             ],
             timeout=25,
         )
         print("  Entering password...")
-        password_field.clear()
-        password_field.send_keys(Config.PASSWORD)
+        _set_input_value(driver, password_field, Config.PASSWORD)
         if not _click_visible_by_texts(
             driver,
-            ["log in", "sign in", "continue", "submit"],
-            timeout=3,
+            ["continue", "log in", "sign in", "submit"],
+            timeout=4,
             exclude_texts=["google", "magic", "password"],
         ):
             password_field.send_keys(Keys.ENTER)
 
         print("  Waiting for post-login redirect...")
-        WebDriverWait(driver, 30).until(
-            lambda d: "dashboard" in d.current_url
-            or d.find_elements(By.CSS_SELECTOR, "[href*='dashboard']")
+        WebDriverWait(driver, 45).until(
+            lambda d: "dashboard" in (d.current_url or "")
+            or "onboarding" in (d.current_url or "").lower()
+            or bool(d.find_elements(By.CSS_SELECTOR, "[href*='dashboard'], a[href*='/jobs/']"))
         )
         print(f"  Login successful. Current URL: {driver.current_url}")
 
@@ -759,6 +857,7 @@ def perform_login(driver) -> bool:
     except Exception as exc:
         print(f"  Login failed: {type(exc).__name__}: {_redact(exc)}")
         _log_page_state(driver, "login")
+        _log_auth_controls(driver, "login-failed")
         _save_page_debug(driver, "movemeon_login_failed")
         send_error_email(
             "Login Failed",
@@ -2621,6 +2720,12 @@ def _cmd_run_monitor(*, run_once: bool, test_details: bool, dry_run: bool, debug
                 "❌ Failed to establish a session. Check movemeon_login_failed.png/html "
                 "or cookie_session_failed.png/html on the server."
             )
+            delay = max(int(Config.SESSION_FAIL_EXIT_DELAY_SECONDS), 0)
+            if delay:
+                print(
+                    f"  Waiting {delay}s before exit to avoid Railway crash-loop / alert spam..."
+                )
+                time.sleep(delay)
             # perform_login already sent the Login Failed alert (with cooldown).
             return 1
 
