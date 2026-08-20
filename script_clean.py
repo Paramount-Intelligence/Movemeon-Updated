@@ -181,6 +181,7 @@ class Config:
 _error_email_last_sent: dict[str, float] = {}
 _first_scan_done = False
 _sending_error_email = False
+_suppress_error_emails = False
 
 JOB_SESSION_SELECTOR = "div.rounded-xl.border.bg-card, a[href*='/jobs/']"
 USER_AGENT = (
@@ -664,30 +665,87 @@ def _set_input_value(driver, elem, value: str) -> None:
     except Exception:
         pass
     try:
-        elem.clear()
-    except Exception:
-        pass
-    try:
         elem.send_keys(Keys.CONTROL, "a")
         elem.send_keys(Keys.BACK_SPACE)
     except Exception:
-        pass
+        try:
+            elem.clear()
+        except Exception:
+            pass
     elem.send_keys(value)
-    # Ensure frameworks that listen for input events see the final value.
+    # Nudge frameworks that listen for input events. Do not overwrite .value via JS —
+    # that often desyncs React/Clerk controlled state.
     try:
         driver.execute_script(
             """
             const el = arguments[0];
-            const val = arguments[1];
-            el.value = val;
             el.dispatchEvent(new Event('input', { bubbles: true }));
             el.dispatchEvent(new Event('change', { bubbles: true }));
             """,
             elem,
-            value,
         )
     except Exception:
         pass
+
+
+def _password_field_visible(driver) -> bool:
+    try:
+        for sel in (
+            "input[type='password']",
+            "input[name*='password' i]",
+            "input[placeholder*='password' i]",
+            "input[autocomplete='current-password']",
+            "#password",
+        ):
+            for elem in driver.find_elements(By.CSS_SELECTOR, sel):
+                try:
+                    if elem.is_displayed():
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        return False
+    return False
+
+
+def _click_login_submit(driver) -> bool:
+    """Click the real password-form submit control (not Google / magic-link)."""
+    try:
+        for elem in driver.find_elements(By.CSS_SELECTOR, "button[type='submit'], input[type='submit']"):
+            try:
+                if not elem.is_displayed() or not elem.is_enabled():
+                    continue
+                label = ((elem.text or "") + " " + (elem.get_attribute("aria-label") or "")).strip().lower()
+                if any(x in label for x in ("google", "magic", "forgot", "sign up", "signup")):
+                    continue
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'}); arguments[0].click();",
+                    elem,
+                )
+                print("  Clicked submit button[type=submit].")
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # On MoveMeOn the password-form CTA is often literally "Log in with password".
+    if _click_visible_by_texts(
+        driver,
+        [
+            "log in with password",
+            "login with password",
+            "continue",
+            "log in",
+            "sign in",
+            "submit",
+        ],
+        timeout=4,
+        exclude_texts=["google", "magic", "forgot", "sign up", "signup", "instead"],
+    ):
+        print("  Clicked login CTA.")
+        return True
+    return False
 
 
 def _log_auth_controls(driver, label: str = "auth") -> None:
@@ -769,10 +827,10 @@ def _navigate_to_search(driver) -> None:
 
 
 def perform_login(driver) -> bool:
-    """MoveMeOn login: choose password method, then email+password → dashboard."""
+    """MoveMeOn login: ensure password form, fill email+password, submit → dashboard."""
     try:
         # Stale cookies often leave the sign-in page in a half-auth state
-        # ("Already have an account? Log out") with no password field.
+        # ("Already have an account? Log out").
         _clear_browser_auth_state(driver)
 
         print("  Navigating to signin page...")
@@ -798,16 +856,17 @@ def perform_login(driver) -> bool:
             time.sleep(4)
             _log_auth_controls(driver, "signin-after-logout")
 
-        # Current MoveMeOn UI often shows method chooser first:
-        # Google / magic link / "Log in with password".
-        if _click_visible_by_texts(
-            driver,
-            ["log in with password", "login with password", "use password"],
-            timeout=10,
-            exclude_texts=["google", "magic"],
-        ):
-            print("  Selected 'Log in with password' (before credentials).")
-            time.sleep(2)
+        # Only click the method chooser when the password field is not already shown.
+        # When the password form is open, "Log in with password" is the SUBMIT CTA.
+        if not _password_field_visible(driver):
+            if _click_visible_by_texts(
+                driver,
+                ["log in with password", "login with password", "use password"],
+                timeout=10,
+                exclude_texts=["google", "magic", "instead"],
+            ):
+                print("  Selected password login method.")
+                time.sleep(2)
 
         print(f"  Entering email: {Config.EMAIL}...")
         email_field = _find_visible_input(
@@ -824,20 +883,7 @@ def perform_login(driver) -> bool:
         )
         _set_input_value(driver, email_field, Config.EMAIL)
 
-        # If password field is not visible yet, advance the form / choose password again.
-        password_ready = False
-        try:
-            for sel in ("input[type='password']", "input[name*='password' i]", "#password"):
-                for elem in driver.find_elements(By.CSS_SELECTOR, sel):
-                    if elem.is_displayed():
-                        password_ready = True
-                        break
-                if password_ready:
-                    break
-        except Exception:
-            password_ready = False
-
-        if not password_ready:
+        if not _password_field_visible(driver):
             if not _click_visible_by_texts(
                 driver,
                 ["continue", "next"],
@@ -849,13 +895,13 @@ def perform_login(driver) -> bool:
                 except Exception:
                     pass
             time.sleep(2)
-            if _click_visible_by_texts(
+            if not _password_field_visible(driver) and _click_visible_by_texts(
                 driver,
                 ["log in with password", "login with password", "use password"],
                 timeout=8,
-                exclude_texts=["google", "magic"],
+                exclude_texts=["google", "magic", "instead"],
             ):
-                print("  Selected 'Log in with password' (after email).")
+                print("  Selected password login method (after email).")
                 time.sleep(2)
 
         print("  Waiting for password field...")
@@ -872,12 +918,9 @@ def perform_login(driver) -> bool:
         )
         print("  Entering password...")
         _set_input_value(driver, password_field, Config.PASSWORD)
-        if not _click_visible_by_texts(
-            driver,
-            ["continue", "log in", "sign in", "submit"],
-            timeout=4,
-            exclude_texts=["google", "magic", "password"],
-        ):
+
+        if not _click_login_submit(driver):
+            print("  No submit CTA found; pressing ENTER on password field.")
             password_field.send_keys(Keys.ENTER)
 
         print("  Waiting for post-login redirect...")
@@ -1866,6 +1909,9 @@ def send_error_email(
     if _sending_error_email:
         print("  ⚠️ Error email skipped — already sending an error notification (recursion guard)")
         return False
+    if _suppress_error_emails:
+        print("  ⚠️ Error email skipped — suppressed for diagnostic mode")
+        return False
     if not Config.ERROR_RECIPIENTS:
         print("  ⚠️ Error email skipped — ERROR_RECIPIENT not configured")
         return False
@@ -2729,6 +2775,28 @@ def _cmd_test_error_email() -> int:
     return 0 if ok else 1
 
 
+def _cmd_test_login() -> int:
+    """Local/diagnostic MoveMeOn login only — no scrape cycle, no error emails."""
+    global _suppress_error_emails
+    print("=" * 60)
+    print("Test MoveMeOn login (--test-login)")
+    print("=" * 60)
+    print(f"  Email: {Config.EMAIL}")
+    print(f"  Headless: {Config.HEADLESS}")
+    driver = None
+    _suppress_error_emails = True
+    try:
+        driver = initialize_driver()
+        ok = perform_login(driver)
+        print("✅ Login test succeeded" if ok else "❌ Login test failed")
+        if ok:
+            print(f"  URL: {driver.current_url}")
+        return 0 if ok else 1
+    finally:
+        _suppress_error_emails = False
+        _safe_quit_driver(driver)
+
+
 def _cmd_run_monitor(*, run_once: bool, test_details: bool, dry_run: bool, debug_extraction: bool) -> int:
     print("=" * 60)
     print(f"🚀 MoveMeOn Job Monitor ({'DRY RUN' if dry_run else 'LIVE'})")
@@ -2942,6 +3010,10 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         "--test-error-email", action="store_true",
         help="Send a test error email to ERROR_RECIPIENT and exit",
     )
+    parser.add_argument(
+        "--test-login", action="store_true",
+        help="Test MoveMeOn login only (no scrape, no error emails) and exit",
+    )
     return parser.parse_args(argv)
 
 
@@ -2970,6 +3042,8 @@ def cli_main(argv: Optional[list] = None) -> int:
             return _cmd_retry_pending_emails(dry_run=args.dry_run)
         if args.test_error_email:
             return _cmd_test_error_email()
+        if args.test_login:
+            return _cmd_test_login()
 
         return _cmd_run_monitor(
             run_once=args.run_once,
