@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -307,6 +308,36 @@ class CategoryNotExposedNoPartialTests(unittest.TestCase):
         self.assertEqual(details["platform_category_extraction_status"], "NOT_EXPOSED")
         self.assertNotIn("platform_category", metadata["fields_missing_but_visible"])
         self.assertIn("location", metadata["fields_missing_but_visible"])
+
+
+class WorkerLockWaitTests(unittest.TestCase):
+    def test_acquire_waits_then_succeeds_when_prior_lock_expires(self):
+        calls = {"n": 0}
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat()
+
+        def fake_acquire(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "acquired": False,
+                    "owner": "old-deploy",
+                    "expires_at": expires,
+                }
+            return {
+                "acquired": True,
+                "owner": "new-deploy",
+                "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=180)).isoformat(),
+            }
+
+        lock = sc.WorkerLockGuard("movemeon", "new-deploy", 180, enabled=True)
+        with mock.patch.object(db, "acquire_worker_lock", side_effect=fake_acquire), \
+             mock.patch.object(sc.time, "sleep") as sleep_mock:
+            ok = lock.acquire(wait=True, max_wait_seconds=120)
+
+        self.assertTrue(ok)
+        self.assertTrue(lock.acquired)
+        self.assertEqual(calls["n"], 2)
+        self.assertTrue(sleep_mock.called)
 
 
 if __name__ == "__main__":

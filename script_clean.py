@@ -290,27 +290,74 @@ class WorkerLockGuard:
         self.acquired = False
         self._last_heartbeat = 0.0
 
-    def acquire(self) -> bool:
+    def acquire(self, *, wait: bool = True, max_wait_seconds: Optional[int] = None) -> bool:
+        """
+        Acquire the platform worker lock.
+
+        When ``wait=True`` (default), if another owner holds the lock we sleep
+        until shortly after ``expires_at`` and retry, instead of exiting and
+        crash-looping under Railway ON_FAILURE.
+        """
         if not self.enabled:
             print("  Worker lock disabled (WORKER_LOCK_ENABLED=false).")
             return False
-        try:
-            result = db.acquire_worker_lock(self.platform, self.owner, self.ttl_seconds)
-        except db.WorkerLockError as exc:
-            if self.allow_missing_schema and "migration" in str(exc).lower():
-                print(f"  WARNING: worker lock schema missing; continuing without a lock. {exc}")
-                return False
-            raise
-        if not result.get("acquired"):
-            raise db.WorkerLockError(
+
+        # Wait at least one full TTL (+ cushion) for a dead holder to expire.
+        wait_budget = max_wait_seconds
+        if wait_budget is None:
+            wait_budget = max(int(self.ttl_seconds) + 60, 240)
+        deadline = time.time() + max(int(wait_budget), 0)
+
+        while True:
+            try:
+                result = db.acquire_worker_lock(self.platform, self.owner, self.ttl_seconds)
+            except db.WorkerLockError as exc:
+                if self.allow_missing_schema and "migration" in str(exc).lower():
+                    print(f"  WARNING: worker lock schema missing; continuing without a lock. {exc}")
+                    return False
+                raise
+
+            if result.get("acquired"):
+                self.acquired = True
+                self._last_heartbeat = time.monotonic()
+                print(f"  Worker lock acquired (owner={self.owner}, ttl={self.ttl_seconds}s).")
+                return True
+
+            holder = result.get("owner")
+            expires_at = result.get("expires_at")
+            msg = (
                 f"Worker lock for platform={self.platform!r} is held by "
-                f"owner={result.get('owner')!r} until {result.get('expires_at')}. "
-                f"Refusing to start another worker (fail closed)."
+                f"owner={holder!r} until {expires_at}."
             )
-        self.acquired = True
-        self._last_heartbeat = time.monotonic()
-        print(f"  Worker lock acquired (owner={self.owner}, ttl={self.ttl_seconds}s).")
-        return True
+            if not wait or time.time() >= deadline:
+                raise db.WorkerLockError(
+                    f"{msg} Refusing to start another worker (fail closed)."
+                )
+
+            sleep_s = 15.0
+            try:
+                if expires_at:
+                    text = str(expires_at)
+                    if text.endswith("Z"):
+                        text = text[:-1] + "+00:00"
+                    exp_dt = datetime.fromisoformat(text)
+                    if exp_dt.tzinfo is None:
+                        exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                    sleep_s = max((exp_dt - datetime.now(timezone.utc)).total_seconds() + 3.0, 5.0)
+            except Exception:
+                sleep_s = 15.0
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise db.WorkerLockError(
+                    f"{msg} Refusing to start another worker (fail closed)."
+                )
+            sleep_s = min(sleep_s, remaining, 60.0)
+            print(
+                f"  {msg} Waiting {sleep_s:.0f}s for it to expire "
+                f"(stale lock from a previous deploy/crash)..."
+            )
+            time.sleep(sleep_s)
 
     def maybe_renew(self) -> None:
         if not self.acquired:
@@ -2720,6 +2767,8 @@ def _cmd_run_monitor(*, run_once: bool, test_details: bool, dry_run: bool, debug
                 "❌ Failed to establish a session. Check movemeon_login_failed.png/html "
                 "or cookie_session_failed.png/html on the server."
             )
+            # Release before the delay so a replacement replica can start.
+            lock.release()
             delay = max(int(Config.SESSION_FAIL_EXIT_DELAY_SECONDS), 0)
             if delay:
                 print(
