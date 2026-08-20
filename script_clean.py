@@ -30,6 +30,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -114,6 +115,25 @@ class Config:
         for e in os.getenv("RECIPIENT_EMAILS", "").split(",")
         if e.strip()
     ]
+    # Prefer ERROR_RECIPIENT; keep typo/plural fallbacks for existing deployments.
+    ERROR_RECIPIENT = (
+        os.getenv("ERROR_RECIPIENT")
+        or os.getenv("error_recipent")
+        or os.getenv("ERROR_RECIPENT")
+        or os.getenv("ERROR_RECIPIENTS")
+        or ""
+    ).strip().strip('"').strip("'")
+    ERROR_RECIPIENTS = [
+        e.strip().strip('"').strip("'")
+        for e in ERROR_RECIPIENT.split(",")
+        if e.strip()
+    ]
+    ERROR_EMAIL_COOLDOWN_MINUTES = _env_int("ERROR_EMAIL_COOLDOWN_MINUTES", 30)
+    SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN = _env_bool("SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN", "false")
+
+    # Immediate SMTP send retries (fresh connection each attempt; not DB lifecycle retries)
+    SMTP_SEND_MAX_ATTEMPTS = _env_int("SMTP_SEND_MAX_ATTEMPTS", 3)
+    SMTP_RETRY_DELAYS_SECONDS = (2, 5, 10)
 
     # --- Schedule ---
     DAILY_RUN_HOUR = _env_int("DAILY_RUN_HOUR", 23)
@@ -153,6 +173,10 @@ class Config:
     # --- Optional Railway health check ---
     PORT = os.getenv("PORT", "").strip()
 
+
+_error_email_last_sent: dict[str, float] = {}
+_first_scan_done = False
+_sending_error_email = False
 
 JOB_SESSION_SELECTOR = "div.rounded-xl.border.bg-card, a[href*='/jobs/']"
 USER_AGENT = (
@@ -634,6 +658,13 @@ def perform_login(driver) -> bool:
         print(f"  Login failed: {type(exc).__name__}: {_redact(exc)}")
         _log_page_state(driver, "login")
         _save_page_debug(driver, "movemeon_login_failed")
+        send_error_email(
+            "Login Failed",
+            exc,
+            details="Full login attempt failed",
+            operation="MoveMeOn authentication",
+            traceback_text=traceback.format_exc(),
+        )
         return False
 
 
@@ -1285,12 +1316,103 @@ def create_email_html(row: dict) -> str:
 </body></html>"""
 
 
+# Transient SMTP / network errors that warrant an immediate resend with a fresh connection.
+_SMTP_RETRYABLE_ERRORS = (
+    smtplib.SMTPServerDisconnected,
+    smtplib.SMTPConnectError,
+    smtplib.SMTPException,
+    ConnectionResetError,
+    ConnectionError,
+    TimeoutError,
+    OSError,
+)
+
+
+def send_email_with_retry(
+    msg: MIMEMultipart,
+    *,
+    max_attempts: Optional[int] = None,
+    delays: Optional[tuple] = None,
+    label: str = "email",
+) -> dict:
+    """
+    Send ``msg`` with a fresh SMTP connection on every attempt.
+
+    Retries up to ``max_attempts`` (default Config.SMTP_SEND_MAX_ATTEMPTS) on
+    connection/SMTP errors. Connections are never held open after send.
+
+    Returns {success, ok, failure_code, error, attempts}.
+    """
+    attempts = max(int(max_attempts if max_attempts is not None else Config.SMTP_SEND_MAX_ATTEMPTS), 1)
+    wait_schedule = tuple(delays if delays is not None else Config.SMTP_RETRY_DELAYS_SECONDS)
+    last_error = None
+    last_code = "UNKNOWN_ERROR"
+    completed = 0
+
+    for attempt in range(1, attempts + 1):
+        completed = attempt
+        try:
+            with smtplib.SMTP(Config.SMTP_SERVER, Config.SMTP_PORT, timeout=30) as server:
+                server.starttls()
+                server.login(Config.SENDER_EMAIL, Config.SENDER_PASSWORD)
+                server.send_message(msg)
+            # ``with`` closes the connection here — never held across worker sleep.
+            if attempt > 1:
+                print(f"  ✅ Email sent successfully on attempt {attempt}/{attempts}")
+            return {
+                "success": True,
+                "ok": True,
+                "failure_code": None,
+                "error": None,
+                "attempts": attempt,
+            }
+        except smtplib.SMTPAuthenticationError as exc:
+            last_error = _redact(exc)
+            last_code = "SMTP_AUTH_ERROR"
+            print(f"  ⚠️ Email attempt {attempt}/{attempts} failed: {last_error}")
+            # Auth will not recover by retrying with the same credentials.
+            break
+        except _SMTP_RETRYABLE_ERRORS as exc:
+            last_error = _redact(exc)
+            if isinstance(exc, (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected)):
+                last_code = "SMTP_CONNECT_ERROR"
+            elif isinstance(exc, smtplib.SMTPException):
+                last_code = "SMTP_SEND_ERROR"
+            else:
+                last_code = "SMTP_CONNECT_ERROR"
+            print(f"  ⚠️ Email attempt {attempt}/{attempts} failed: {last_error}")
+            if attempt < attempts:
+                delay = wait_schedule[min(attempt - 1, len(wait_schedule) - 1)] if wait_schedule else 2
+                print(f"  🔄 Retrying email in {delay} seconds...")
+                time.sleep(max(int(delay), 0))
+                continue
+        except Exception as exc:
+            last_error = _redact(f"{type(exc).__name__}: {exc}")
+            last_code = "UNKNOWN_ERROR"
+            print(f"  ⚠️ Email attempt {attempt}/{attempts} failed: {last_error}")
+            if attempt < attempts:
+                delay = wait_schedule[min(attempt - 1, len(wait_schedule) - 1)] if wait_schedule else 2
+                print(f"  🔄 Retrying email in {delay} seconds...")
+                time.sleep(max(int(delay), 0))
+                continue
+
+    print(f"  ❌ Email permanently failed after {completed} attempts")
+    return {
+        "success": False,
+        "ok": False,
+        "failure_code": last_code,
+        "error": last_error,
+        "attempts": completed,
+    }
+
+
 def send_notification(row: dict) -> dict:
     """
-    Send the notification email. Always returns a result dict —
-    {success, ok, message_id, failure_code, error} — never a bare bool.
+    Send the job notification email with immediate SMTP retries.
+    Always returns {success, ok, message_id, failure_code, error, attempts}.
     """
     title = row.get("title") or "New Job"
+    print(f"  📧 Sending email: {title[:60]}")
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = f"🔔 MoveMeOn: {title}"[:250]
@@ -1300,30 +1422,37 @@ def send_notification(row: dict) -> dict:
         msg["Message-ID"] = message_id
         msg.attach(MIMEText(create_email_html(row), "html"))
 
-        with smtplib.SMTP(Config.SMTP_SERVER, Config.SMTP_PORT, timeout=30) as server:
-            server.starttls()
-            server.login(Config.SENDER_EMAIL, Config.SENDER_PASSWORD)
-            server.send_message(msg)
-
-        print(f"  📧 Email sent: {title[:60]}")
-        return {"success": True, "ok": True, "message_id": message_id, "failure_code": None, "error": None}
-
-    except smtplib.SMTPAuthenticationError as exc:
-        err = _redact(exc)
-        print(f"  ❌ Email auth failed: {err}")
-        return {"success": False, "ok": False, "message_id": None, "failure_code": "SMTP_AUTH_ERROR", "error": err}
-    except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, TimeoutError, OSError) as exc:
-        err = _redact(exc)
-        print(f"  ❌ Email connection failed: {err}")
-        return {"success": False, "ok": False, "message_id": None, "failure_code": "SMTP_CONNECT_ERROR", "error": err}
-    except smtplib.SMTPException as exc:
-        err = _redact(exc)
-        print(f"  ❌ Email send failed: {err}")
-        return {"success": False, "ok": False, "message_id": None, "failure_code": "SMTP_SEND_ERROR", "error": err}
+        result = send_email_with_retry(msg, label=title[:60])
+        if result.get("success"):
+            if result.get("attempts", 1) == 1:
+                print(f"  📧 Email sent: {title[:60]}")
+            return {
+                "success": True,
+                "ok": True,
+                "message_id": message_id,
+                "failure_code": None,
+                "error": None,
+                "attempts": result.get("attempts", 1),
+            }
+        return {
+            "success": False,
+            "ok": False,
+            "message_id": None,
+            "failure_code": result.get("failure_code"),
+            "error": result.get("error"),
+            "attempts": result.get("attempts"),
+        }
     except Exception as exc:
         err = _redact(f"{type(exc).__name__}: {exc}")
         print(f"  ❌ Email failed (unexpected): {err}")
-        return {"success": False, "ok": False, "message_id": None, "failure_code": "UNKNOWN_ERROR", "error": err}
+        return {
+            "success": False,
+            "ok": False,
+            "message_id": None,
+            "failure_code": "UNKNOWN_ERROR",
+            "error": err,
+            "attempts": 0,
+        }
 
 
 def process_project_email(row: dict) -> dict:
@@ -1331,6 +1460,9 @@ def process_project_email(row: dict) -> dict:
     Create an email_attempts row BEFORE sending, then update the SAME
     projects.id with the outcome. Success -> SENT. Failure -> RETRY_PENDING
     (with backoff) or FAILED once EMAIL_MAX_RETRIES is reached.
+
+    Immediate SMTP retries happen inside send_notification and do not create
+    extra DB rows or duplicate notifications.
     """
     row_id = row.get("id")
     if not row_id:
@@ -1338,6 +1470,8 @@ def process_project_email(row: dict) -> dict:
 
     attempt_number = int(row.get("email_attempt_count") or 0) + 1
     now_iso = _utc_iso()
+    title = row.get("title") or "New Job"
+    job_url = row.get("source_url") or row.get("url") or ""
 
     attempt = db.create_email_attempt(row_id, attempt_number, recipients=Config.RECIPIENT_EMAILS)
     result = send_notification(row)
@@ -1376,8 +1510,188 @@ def process_project_email(row: dict) -> dict:
             email_last_attempt_at=now_iso,
             email_next_retry_at=next_retry,
         )
+        # Permanent SMTP failure for this send (all immediate retries exhausted).
+        smtp_attempts = result.get("attempts") or Config.SMTP_SEND_MAX_ATTEMPTS
+        print("  🚨 Sending failure report to ERROR_RECIPIENT")
+        send_error_email(
+            "Email Sending Failed",
+            result.get("error") or "Email send failed",
+            details=(
+                f"Operation: Send job notification email\n"
+                f"Job: {title}\n"
+                f"URL: {job_url}\n"
+                f"DB lifecycle attempt: {attempt_number}/{Config.EMAIL_MAX_RETRIES}\n"
+                f"SMTP attempts: {smtp_attempts}/{Config.SMTP_SEND_MAX_ATTEMPTS}"
+            ),
+            operation="Send job notification email",
+            job_title=title,
+            job_url=job_url,
+            retry_count=smtp_attempts,
+            max_retries=Config.SMTP_SEND_MAX_ATTEMPTS,
+            error_type=result.get("failure_code") or "EmailSendError",
+        )
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Error notification emails (sent to ERROR_RECIPIENT)
+# ---------------------------------------------------------------------------
+
+def send_error_email(
+    context: str,
+    error,
+    *,
+    details: str = "",
+    traceback_text: str = "",
+    force: bool = False,
+    operation: str = "",
+    job_title: str = "",
+    job_url: str = "",
+    retry_count: Optional[int] = None,
+    max_retries: Optional[int] = None,
+    error_type: str = "",
+) -> bool:
+    """Send an operational error email to ERROR_RECIPIENT.
+
+    Uses ``send_email_with_retry`` for SMTP resilience. On failure only logs —
+    never triggers another error email (recursion guard via ``_sending_error_email``).
+    """
+    global _sending_error_email
+
+    if _sending_error_email:
+        print("  ⚠️ Error email skipped — already sending an error notification (recursion guard)")
+        return False
+    if not Config.ERROR_RECIPIENTS:
+        print("  ⚠️ Error email skipped — ERROR_RECIPIENT not configured")
+        return False
+    if not Config.SENDER_EMAIL or not Config.SENDER_PASSWORD:
+        print("  ⚠️ Error email skipped — SENDER_EMAIL / SENDER_PASSWORD missing")
+        return False
+
+    fingerprint = context
+    if not force:
+        cooldown_s = max(Config.ERROR_EMAIL_COOLDOWN_MINUTES, 0) * 60
+        last = _error_email_last_sent.get(fingerprint)
+        if last is not None and (time.time() - last) < cooldown_s:
+            print(f"  ⏳ Error email for '{context}' suppressed (cooldown active)")
+            return False
+
+    error_str = _redact(error) if error else "Unknown error"
+    if not error_type:
+        error_type = (
+            type(error).__name__
+            if error is not None and not isinstance(error, str)
+            else "Error"
+        )
+    now_pkt = datetime.now(PKT).strftime("%Y-%m-%d %H:%M:%S PKT")
+    worker_id = get_worker_owner()
+    op_label = operation or context
+    attempts_line = ""
+    if retry_count is not None:
+        cap = max_retries if max_retries is not None else Config.SMTP_SEND_MAX_ATTEMPTS
+        attempts_line = f"Attempts: {retry_count}/{cap}"
+
+    body_lines = [
+        "Movemeon production worker encountered an error.",
+        "",
+        f"Operation: {op_label}",
+    ]
+    if job_title:
+        body_lines.append(f"Job: {job_title}")
+    if job_url:
+        body_lines.append(f"URL: {job_url}")
+    body_lines.extend(
+        [
+            f"Error Type: {error_type}",
+            f"Error: {error_str}",
+        ]
+    )
+    if attempts_line:
+        body_lines.append(attempts_line)
+    body_lines.extend(
+        [
+            f"Timestamp: {now_pkt}",
+            f"Worker: {worker_id}",
+            f"Platform: {PLATFORM}",
+        ]
+    )
+    if details:
+        body_lines.extend(["", "Details:", details])
+    if traceback_text:
+        body_lines.extend(["", "Traceback:", traceback_text[:3000]])
+    plain_body = "\n".join(body_lines)
+
+    rows_html = ""
+    info_rows = [
+        ("Operation", op_label),
+        ("Error Type", error_type),
+        ("Error", error_str),
+        ("Time", now_pkt),
+        ("Worker", worker_id),
+        ("Platform", PLATFORM),
+    ]
+    if job_title:
+        info_rows.insert(1, ("Job", job_title))
+    if job_url:
+        info_rows.insert(2 if job_title else 1, ("URL", job_url))
+    if attempts_line:
+        info_rows.append(("Attempts", attempts_line.replace("Attempts: ", "")))
+    if details:
+        info_rows.append(("Details", details))
+    if traceback_text:
+        info_rows.append(
+            ("Traceback", f"<pre style='white-space:pre-wrap'>{_esc(traceback_text[:3000])}</pre>")
+        )
+    for label, val in info_rows:
+        # Traceback is already HTML-escaped; other fields need escaping.
+        cell = val if label == "Traceback" else _esc(str(val))
+        rows_html += (
+            f"<tr><td style='padding:8px 14px;color:#555;border-bottom:1px solid #eee;'>"
+            f"<strong>{_esc(label)}</strong></td>"
+            f"<td style='padding:8px 14px;border-bottom:1px solid #eee;'>{cell}</td></tr>"
+        )
+
+    html = f"""\
+<html><body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
+<div style="max-width:600px;margin:20px auto;background:#fff;border-radius:8px;overflow:hidden;
+            box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+  <div style="background:#d32f2f;color:#fff;padding:20px 28px;">
+    <h2 style="margin:0;">Movemeon Worker Error</h2>
+  </div>
+  <div style="padding:20px 28px;">
+    <p style="color:#333;">Movemeon production worker encountered an error.</p>
+    <table style="width:100%;border-collapse:collapse;">{rows_html}</table>
+  </div>
+  <div style="background:#f8f9fa;padding:14px 28px;border-top:1px solid #eee;
+       font-size:12px;color:#999;text-align:center;">
+    MoveMeOn Job Monitor &nbsp;|&nbsp; Operational error alert &nbsp;|&nbsp; {now_pkt}
+  </div>
+</div></body></html>"""
+
+    subject = f"Movemeon Worker Error - {context}"[:250]
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = Config.SENDER_EMAIL
+    msg["To"] = ", ".join(Config.ERROR_RECIPIENTS)
+    msg.attach(MIMEText(plain_body, "plain"))
+    msg.attach(MIMEText(html, "html"))
+
+    _sending_error_email = True
+    try:
+        result = send_email_with_retry(msg, label=f"error:{context}")
+        if result.get("success"):
+            _error_email_last_sent[fingerprint] = time.time()
+            print(f"  📧 Error email sent to {Config.ERROR_RECIPIENT}")
+            return True
+        # Do NOT call send_error_email again — recursion guard + log only.
+        print(f"  ❌ Failed to send error email to ERROR_RECIPIENT: {result.get('error')}")
+        return False
+    except Exception as exc:
+        print(f"  ❌ Failed to send error email to ERROR_RECIPIENT: {_redact(exc)}")
+        return False
+    finally:
+        _sending_error_email = False
 
 
 def retry_pending_emails(*, dry_run: bool = False) -> dict:
@@ -1683,6 +1997,7 @@ def run_scrape_cycle(
     Category NOT_EXPOSED never counts as a real failure and never causes
     PARTIAL — only genuine extraction/DB/email failures do.
     """
+    global _first_scan_done
     stats = _new_stats()
     had_real_failure = False
     auth_failed = False
@@ -1804,6 +2119,15 @@ def run_scrape_cycle(
                 else:
                     email_eligible, email_status, email_reason = True, "PENDING", None
 
+                if (
+                    email_eligible
+                    and not _first_scan_done
+                    and Config.SUPPRESS_PROJECT_EMAILS_ON_FIRST_SCAN
+                ):
+                    email_eligible, email_status, email_reason = (
+                        False, "SUPPRESSED", "FIRST_SCAN_SUPPRESSED",
+                    )
+
                 if dry_run:
                     print(
                         f"    [DRY RUN] Would insert '{merged.get('title', '')[:60]}' "
@@ -1863,6 +2187,7 @@ def run_scrape_cycle(
         print(f"  Scan cycle error: {_redact(exc)}")
         raise
     else:
+        _first_scan_done = True
         if not dry_run and run_id:
             status = "PARTIAL" if had_real_failure else "COMPLETED"
             try:
@@ -2072,6 +2397,28 @@ def _cmd_retry_pending_emails(*, dry_run: bool = False) -> int:
     return 0 if result["failed"] == 0 else 1
 
 
+def _cmd_test_error_email() -> int:
+    print("=" * 60)
+    print("Test error email (--test-error-email)")
+    print("=" * 60)
+    if Config.ERROR_RECIPIENT:
+        print(f"  ERROR_RECIPIENT: {Config.ERROR_RECIPIENT}")
+    else:
+        print("  ERROR_RECIPIENT: NOT CONFIGURED")
+        print("❌ Cannot send test — configure ERROR_RECIPIENT first")
+        return 1
+    ok = send_error_email(
+        "Email Sending Failed",
+        "Forced test alert from MoveMeOn Monitor",
+        details="This is a forced test of send_error_email(). No browser or Supabase write was opened.",
+        force=True,
+        operation="Test error notification",
+        error_type="TEST_ERROR_EMAIL",
+    )
+    print("✅ Test error email sent" if ok else "❌ Test error email failed")
+    return 0 if ok else 1
+
+
 def _cmd_run_monitor(*, run_once: bool, test_details: bool, dry_run: bool, debug_extraction: bool) -> int:
     print("=" * 60)
     print(f"🚀 MoveMeOn Job Monitor ({'DRY RUN' if dry_run else 'LIVE'})")
@@ -2094,11 +2441,27 @@ def _cmd_run_monitor(*, run_once: bool, test_details: bool, dry_run: bool, debug
             print(f"WORKER LOCK ERROR: {exc}")
             return 1
 
-        driver = initialize_driver()
+        try:
+            driver = initialize_driver()
+        except Exception as init_exc:
+            print(f"❌ Browser/ChromeDriver initialization failed: {_redact(init_exc)}")
+            send_error_email(
+                "Browser Initialization Failed",
+                init_exc,
+                operation="Initialize ChromeDriver",
+                traceback_text=traceback.format_exc(),
+            )
+            return 1
         if not setup_session(driver):
             print(
                 "❌ Failed to establish a session. Check movemeon_login_failed.png/html "
                 "or cookie_session_failed.png/html on the server."
+            )
+            send_error_email(
+                "Session Setup Failed",
+                "Could not establish MoveMeOn session",
+                details="Initial session setup failed on startup. Browser cookies or login may be stale.",
+                operation="Establish MoveMeOn session",
             )
             return 1
 
@@ -2117,6 +2480,12 @@ def _cmd_run_monitor(*, run_once: bool, test_details: bool, dry_run: bool, debug
                     driver = recreate_browser_session(driver)
                 except Exception as rec_exc:
                     print(f"❌ Could not recreate Chrome before scan: {_redact(rec_exc)}")
+                    send_error_email(
+                        "Chrome Recreate Failed",
+                        rec_exc,
+                        details="Pre-scan browser restart failed",
+                        operation="Recreate Chrome before daily scan",
+                    )
                     return 1
 
             max_attempts = max(int(Config.SCAN_CRASH_MAX_RETRIES), 1)
@@ -2147,16 +2516,30 @@ def _cmd_run_monitor(*, run_once: bool, test_details: bool, dry_run: bool, debug
                             driver = recreate_browser_session(driver)
                         except Exception as rec_exc:
                             print(f"❌ Chrome restart failed: {_redact(rec_exc)}")
+                            send_error_email(
+                                "Chrome Restart Failed",
+                                rec_exc,
+                                details=f"Crash retry {attempt}/{max_attempts} — browser restart failed",
+                                operation="Restart Chrome after tab crash",
+                                retry_count=attempt,
+                                max_retries=max_attempts,
+                            )
                             return 1
                         time.sleep(max(int(Config.SCAN_CRASH_RETRY_SECONDS), 0))
                         continue
-                    print(
-                        f"⚠️ Scan cycle failed: {_redact(exc)}"
-                        + (
-                            " — same-day retries exhausted."
+                    tb_text = traceback.format_exc() if crashed else ""
+                    send_error_email(
+                        "Scan Cycle Failed",
+                        exc,
+                        details=(
+                            f"Same-day retries exhausted ({attempt}/{max_attempts})"
                             if crashed
-                            else " — will retry at the next scheduled run."
-                        )
+                            else f"Scan failed (non-crash error, attempt {attempt})"
+                        ),
+                        traceback_text=tb_text,
+                        operation="Scheduled job scan",
+                        retry_count=attempt,
+                        max_retries=max_attempts,
                     )
                     break
 
@@ -2165,14 +2548,19 @@ def _cmd_run_monitor(*, run_once: bool, test_details: bool, dry_run: bool, debug
                 return 0 if scan_ok else 1
 
             if not scan_ok:
-                # Exit so Railway ON_FAILURE restarts the container. Startup
-                # runs a scan immediately, which resumes the same day's work.
                 print(
                     "❌ Scan did not complete. Exiting so the platform can restart "
                     "the process and retry without waiting 24 hours."
                 )
                 if last_error is not None:
                     print(f"   Last error: {_redact(last_error)}")
+                    send_error_email(
+                        "Scan Not Completed",
+                        last_error,
+                        details="Scan did not complete. Process exiting for container restart.",
+                        traceback_text=traceback.format_exc(),
+                        operation="Scheduled worker run",
+                    )
                 return 1
 
             lock.maybe_renew()
@@ -2237,6 +2625,10 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         "--retry-pending-emails", action="store_true",
         help="Retry RETRY_PENDING emails that are due, then exit",
     )
+    parser.add_argument(
+        "--test-error-email", action="store_true",
+        help="Send a test error email to ERROR_RECIPIENT and exit",
+    )
     return parser.parse_args(argv)
 
 
@@ -2263,6 +2655,8 @@ def cli_main(argv: Optional[list] = None) -> int:
             )
         if args.retry_pending_emails:
             return _cmd_retry_pending_emails(dry_run=args.dry_run)
+        if args.test_error_email:
+            return _cmd_test_error_email()
 
         return _cmd_run_monitor(
             run_once=args.run_once,

@@ -8,9 +8,12 @@ database.py. All Supabase and SMTP calls are mocked — no live network.
 from __future__ import annotations
 
 import os
+import smtplib
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -124,6 +127,7 @@ class ProcessProjectEmailTests(unittest.TestCase):
             mock.patch.object(db, "complete_email_attempt_failure"),
             mock.patch.object(db, "update_project_email_status"),
             mock.patch.object(sc, "send_notification"),
+            mock.patch.object(sc, "send_error_email", return_value=True),
         ]
         (
             self.mock_create,
@@ -131,6 +135,7 @@ class ProcessProjectEmailTests(unittest.TestCase):
             self.mock_failure,
             self.mock_update,
             self.mock_send,
+            self.mock_error_email,
         ) = (p.start() for p in self.patchers)
         self.mock_create.return_value = {"id": "attempt-uuid-1"}
 
@@ -161,13 +166,15 @@ class ProcessProjectEmailTests(unittest.TestCase):
         self.assertEqual(update_args[0], "row-uuid-1")
         self.assertEqual(update_kwargs["email_status"], "SENT")
         self.assertTrue(update_kwargs["email_sent"])
+        self.mock_error_email.assert_not_called()
 
     def test_failure_sets_retry_pending_with_backoff(self):
         self.mock_send.return_value = {
             "success": False, "ok": False, "message_id": None,
             "failure_code": "SMTP_SEND_ERROR", "error": "boom",
+            "attempts": 3,
         }
-        row = {"id": "row-uuid-2", "email_attempt_count": 0}
+        row = {"id": "row-uuid-2", "email_attempt_count": 0, "title": "Job A"}
         with mock.patch.object(sc.Config, "EMAIL_MAX_RETRIES", 3):
             result = sc.process_project_email(row)
 
@@ -176,11 +183,14 @@ class ProcessProjectEmailTests(unittest.TestCase):
         update_kwargs = self.mock_update.call_args.kwargs
         self.assertEqual(update_kwargs["email_status"], "RETRY_PENDING")
         self.assertIsNotNone(update_kwargs["email_next_retry_at"])
+        self.mock_error_email.assert_called_once()
+        self.assertEqual(self.mock_error_email.call_args.args[0], "Email Sending Failed")
 
     def test_max_retries_reached_produces_failed_with_no_retry(self):
         self.mock_send.return_value = {
             "success": False, "ok": False, "message_id": None,
             "failure_code": "SMTP_AUTH_ERROR", "error": "bad creds",
+            "attempts": 1,
         }
         row = {"id": "row-uuid-3", "email_attempt_count": 2}  # next attempt == 3
         with mock.patch.object(sc.Config, "EMAIL_MAX_RETRIES", 3):
@@ -190,6 +200,7 @@ class ProcessProjectEmailTests(unittest.TestCase):
         update_kwargs = self.mock_update.call_args.kwargs
         self.assertEqual(update_kwargs["email_status"], "FAILED")
         self.assertIsNone(update_kwargs["email_next_retry_at"])
+        self.mock_error_email.assert_called_once()
 
     def test_project_insert_occurs_before_email_send(self):
         order = []
@@ -223,6 +234,94 @@ class ProcessProjectEmailTests(unittest.TestCase):
                     sc.process_project_email(row)
 
         self.assertEqual(order, ["insert", "create_attempt", "send"])
+
+
+class SmtpRetryHelperTests(unittest.TestCase):
+    """Immediate SMTP retries inside send_email_with_retry."""
+
+    def setUp(self):
+        sc._sending_error_email = False
+        sc._error_email_last_sent.clear()
+
+    def _msg(self):
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "t"
+        msg["From"] = "from@example.com"
+        msg["To"] = "to@example.com"
+        msg.attach(MIMEText("body", "plain"))
+        return msg
+
+    def test_retries_transient_disconnect_then_succeeds(self):
+        smtp_inst = mock.MagicMock()
+        smtp_cm = mock.MagicMock()
+        smtp_cm.__enter__.return_value = smtp_inst
+        smtp_cm.__exit__.return_value = False
+
+        call_count = {"n": 0}
+
+        def smtp_factory(*_a, **_k):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise smtplib.SMTPServerDisconnected("Connection unexpectedly closed")
+            return smtp_cm
+
+        with mock.patch.object(sc.Config, "SMTP_SERVER", "smtp.example.com"):
+            with mock.patch.object(sc.Config, "SMTP_PORT", 587):
+                with mock.patch.object(sc.Config, "SENDER_EMAIL", "from@example.com"):
+                    with mock.patch.object(sc.Config, "SENDER_PASSWORD", "pw"):
+                        with mock.patch.object(sc.Config, "SMTP_SEND_MAX_ATTEMPTS", 3):
+                            with mock.patch.object(sc.Config, "SMTP_RETRY_DELAYS_SECONDS", (0, 0, 0)):
+                                with mock.patch.object(sc.smtplib, "SMTP", side_effect=smtp_factory):
+                                    with mock.patch.object(sc.time, "sleep"):
+                                        result = sc.send_email_with_retry(self._msg())
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(call_count["n"], 2)
+        smtp_inst.send_message.assert_called_once()
+
+    def test_permanently_fails_after_three_attempts(self):
+        def smtp_factory(*_a, **_k):
+            raise smtplib.SMTPServerDisconnected("Connection unexpectedly closed")
+
+        with mock.patch.object(sc.Config, "SMTP_SERVER", "smtp.example.com"):
+            with mock.patch.object(sc.Config, "SMTP_PORT", 587):
+                with mock.patch.object(sc.Config, "SENDER_EMAIL", "from@example.com"):
+                    with mock.patch.object(sc.Config, "SENDER_PASSWORD", "pw"):
+                        with mock.patch.object(sc.Config, "SMTP_SEND_MAX_ATTEMPTS", 3):
+                            with mock.patch.object(sc.Config, "SMTP_RETRY_DELAYS_SECONDS", (0, 0, 0)):
+                                with mock.patch.object(sc.smtplib, "SMTP", side_effect=smtp_factory):
+                                    with mock.patch.object(sc.time, "sleep") as sleep_mock:
+                                        result = sc.send_email_with_retry(self._msg())
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["attempts"], 3)
+        self.assertEqual(result["failure_code"], "SMTP_CONNECT_ERROR")
+        self.assertEqual(sleep_mock.call_count, 2)
+
+    def test_error_email_does_not_recurse_on_smtp_failure(self):
+        def smtp_factory(*_a, **_k):
+            raise smtplib.SMTPServerDisconnected("down")
+
+        with mock.patch.object(sc.Config, "ERROR_RECIPIENT", "ops@example.com"):
+            with mock.patch.object(sc.Config, "ERROR_RECIPIENTS", ["ops@example.com"]):
+                with mock.patch.object(sc.Config, "SENDER_EMAIL", "from@example.com"):
+                    with mock.patch.object(sc.Config, "SENDER_PASSWORD", "pw"):
+                        with mock.patch.object(sc.Config, "SMTP_SERVER", "smtp.example.com"):
+                            with mock.patch.object(sc.Config, "SMTP_PORT", 587):
+                                with mock.patch.object(sc.Config, "SMTP_SEND_MAX_ATTEMPTS", 3):
+                                    with mock.patch.object(sc.Config, "SMTP_RETRY_DELAYS_SECONDS", (0, 0, 0)):
+                                        with mock.patch.object(sc.smtplib, "SMTP", side_effect=smtp_factory):
+                                            with mock.patch.object(sc.time, "sleep"):
+                                                ok = sc.send_error_email(
+                                                    "Email Sending Failed",
+                                                    "boom",
+                                                    force=True,
+                                                    operation="Send job notification email",
+                                                )
+
+        self.assertFalse(ok)
+        self.assertFalse(sc._sending_error_email)
 
 
 class RetryBackoffTests(unittest.TestCase):

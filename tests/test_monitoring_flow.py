@@ -218,6 +218,7 @@ class BrowserCrashRecoveryTests(unittest.TestCase):
              mock.patch.object(sc, "run_scrape_cycle", side_effect=fake_scan), \
              mock.patch.object(sc, "recreate_browser_session", return_value=fake_driver) as mock_recreate, \
              mock.patch.object(sc, "sleep_until_next_run", side_effect=KeyboardInterrupt), \
+             mock.patch.object(sc, "send_error_email", return_value=True), \
              mock.patch.object(sc.Config, "SCAN_CRASH_MAX_RETRIES", 3), \
              mock.patch.object(sc.Config, "SCAN_CRASH_RETRY_SECONDS", 0), \
              mock.patch.object(sc.time, "sleep"):
@@ -248,6 +249,7 @@ class BrowserCrashRecoveryTests(unittest.TestCase):
              mock.patch.object(sc, "run_scrape_cycle", side_effect=fake_scan), \
              mock.patch.object(sc, "recreate_browser_session", return_value=fake_driver), \
              mock.patch.object(sc, "sleep_until_next_run") as mock_sleep, \
+             mock.patch.object(sc, "send_error_email", return_value=True), \
              mock.patch.object(sc.Config, "SCAN_CRASH_MAX_RETRIES", 3), \
              mock.patch.object(sc.Config, "SCAN_CRASH_RETRY_SECONDS", 0), \
              mock.patch.object(sc.time, "sleep"):
@@ -271,6 +273,7 @@ class BrowserCrashRecoveryTests(unittest.TestCase):
              mock.patch.object(sc, "run_scrape_cycle", side_effect=crash), \
              mock.patch.object(sc, "recreate_browser_session", return_value=fake_driver), \
              mock.patch.object(sc, "sleep_until_next_run") as mock_sleep, \
+             mock.patch.object(sc, "send_error_email", return_value=True), \
              mock.patch.object(sc.Config, "SCAN_CRASH_MAX_RETRIES", 2), \
              mock.patch.object(sc.Config, "SCAN_CRASH_RETRY_SECONDS", 0), \
              mock.patch.object(sc.time, "sleep"):
