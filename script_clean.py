@@ -551,6 +551,68 @@ def _find_visible_input(driver, selectors: list, timeout: int = 20):
     return WebDriverWait(driver, timeout).until(_locator)
 
 
+def _click_visible_by_texts(
+    driver,
+    texts: list[str],
+    *,
+    timeout: int = 8,
+    exclude_texts: Optional[list[str]] = None,
+    exact: bool = False,
+) -> bool:
+    """Click the first visible element whose text matches any of ``texts``."""
+    lowered = [t.strip().lower() for t in texts if t and t.strip()]
+    excluded = [t.strip().lower() for t in (exclude_texts or []) if t and t.strip()]
+    if not lowered:
+        return False
+    end = time.time() + max(timeout, 1)
+    while time.time() < end:
+        for text in lowered:
+            xpaths = (
+                f"//button[contains(translate(normalize-space(.),"
+                f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{text}')]",
+                f"//a[contains(translate(normalize-space(.),"
+                f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{text}')]",
+                f"//*[@role='button' and contains(translate(normalize-space(.),"
+                f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{text}')]",
+                f"//span[contains(translate(normalize-space(.),"
+                f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{text}')]/parent::button",
+                f"//span[contains(translate(normalize-space(.),"
+                f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{text}')]/parent::a",
+            )
+            for xpath in xpaths:
+                try:
+                    for elem in driver.find_elements(By.XPATH, xpath):
+                        if not elem.is_displayed():
+                            continue
+                        label = (elem.text or "").strip().lower()
+                        if not label:
+                            continue
+                        if any(ex in label for ex in excluded):
+                            continue
+                        if exact and label != text:
+                            continue
+                        if not exact and text not in label:
+                            continue
+                        driver.execute_script("arguments[0].click();", elem)
+                        return True
+                except Exception:
+                    continue
+        time.sleep(0.4)
+    return False
+
+
+def _clear_browser_auth_state(driver) -> None:
+    """Drop cookies/localStorage so a stale half-session cannot block password login."""
+    try:
+        driver.delete_all_cookies()
+    except Exception:
+        pass
+    try:
+        driver.execute_script("window.localStorage.clear(); window.sessionStorage.clear();")
+    except Exception:
+        pass
+
+
 def _skip_onboarding_if_present(driver, label: str = "onboarding") -> None:
     print(f"  [{label}] Redirected to onboarding page. Attempting to click 'Skip'...")
     try:
@@ -592,8 +654,12 @@ def _navigate_to_search(driver) -> None:
 
 
 def perform_login(driver) -> bool:
-    """Two-step MoveMeOn login: email screen, then password screen."""
+    """MoveMeOn login: email → choose password method → password → dashboard."""
     try:
+        # Stale cookies often leave the sign-in page in a half-auth state
+        # ("Already have an account? Log out") with no password field.
+        _clear_browser_auth_state(driver)
+
         print("  Navigating to signin page...")
         driver.get("https://portal.movemeon.com/auth/signin")
         try:
@@ -606,6 +672,14 @@ def perform_login(driver) -> bool:
             print("  Already logged in.")
             return True
 
+        # Clear residual "Log out" / half-session UI before filling credentials.
+        if _click_visible_by_texts(driver, ["log out", "logout", "sign out"], timeout=3):
+            print("  Clicked Log out to clear stale session state.")
+            time.sleep(2)
+            _clear_browser_auth_state(driver)
+            driver.get("https://portal.movemeon.com/auth/signin")
+            time.sleep(3)
+
         print(f"  Entering email: {Config.EMAIL}...")
         email_field = _find_visible_input(
             driver,
@@ -616,11 +690,31 @@ def perform_login(driver) -> bool:
                 "#email",
             ],
         )
+        email_field.clear()
         email_field.send_keys(Config.EMAIL)
-        email_field.send_keys(Keys.ENTER)
+
+        # Some flows need Continue/Next; ENTER alone is not always enough.
+        # Never click Google / magic-link buttons here.
+        if not _click_visible_by_texts(
+            driver,
+            ["continue", "next"],
+            timeout=3,
+            exclude_texts=["google", "magic"],
+        ):
+            email_field.send_keys(Keys.ENTER)
+        time.sleep(2)
+
+        # Current MoveMeOn UI shows a method chooser before the password input.
+        if _click_visible_by_texts(
+            driver,
+            ["log in with password", "login with password", "use password"],
+            timeout=8,
+            exclude_texts=["google", "magic"],
+        ):
+            print("  Selected 'Log in with password'.")
+            time.sleep(2)
 
         print("  Waiting for password field...")
-        time.sleep(3)
         password_field = _find_visible_input(
             driver,
             [
@@ -629,10 +723,18 @@ def perform_login(driver) -> bool:
                 "input[placeholder*='password' i]",
                 "#password",
             ],
+            timeout=25,
         )
         print("  Entering password...")
+        password_field.clear()
         password_field.send_keys(Config.PASSWORD)
-        password_field.send_keys(Keys.ENTER)
+        if not _click_visible_by_texts(
+            driver,
+            ["log in", "sign in", "continue", "submit"],
+            timeout=3,
+            exclude_texts=["google", "magic", "password"],
+        ):
+            password_field.send_keys(Keys.ENTER)
 
         print("  Waiting for post-login redirect...")
         WebDriverWait(driver, 30).until(
@@ -681,7 +783,13 @@ def setup_session(driver) -> bool:
         except Exception:
             _log_page_state(driver, "cookie session")
             _save_page_debug(driver, "cookie_session_failed")
-            print("  Cookies may be invalid or expired; falling back to full login.")
+            print("  Cookies may be invalid or expired; clearing and falling back to full login.")
+            _clear_browser_auth_state(driver)
+            try:
+                db.delete_scraper_session(PLATFORM)
+                print("  Cleared stale Supabase scraper session for movemeon.")
+            except Exception as exc:
+                print(f"  WARNING: could not clear Supabase session: {_redact(exc)}")
     return perform_login(driver)
 
 
@@ -1538,6 +1646,56 @@ def process_project_email(row: dict) -> dict:
 # Error notification emails (sent to ERROR_RECIPIENT)
 # ---------------------------------------------------------------------------
 
+def _load_persistent_error_cooldowns() -> dict:
+    """Load error-email cooldown map from scraper_sessions.metadata (survives restarts)."""
+    try:
+        row = db.load_scraper_session(PLATFORM)
+        if not row:
+            return {}
+        meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        raw = meta.get("error_email_cooldowns") or {}
+        if not isinstance(raw, dict):
+            return {}
+        out = {}
+        for key, value in raw.items():
+            try:
+                out[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return out
+    except Exception as exc:
+        print(f"  WARNING: could not load error-email cooldowns: {_redact(exc)}")
+        return {}
+
+
+def _save_persistent_error_cooldown(fingerprint: str, sent_at: float) -> None:
+    """Persist one cooldown timestamp so Railway restarts do not re-spam alerts."""
+    try:
+        cooldowns = _load_persistent_error_cooldowns()
+        cooldowns[str(fingerprint)] = float(sent_at)
+        # Keep the map bounded.
+        if len(cooldowns) > 50:
+            newest = sorted(cooldowns.items(), key=lambda kv: kv[1], reverse=True)[:50]
+            cooldowns = dict(newest)
+        updated = db.merge_scraper_session_metadata(
+            PLATFORM, {"error_email_cooldowns": cooldowns}
+        )
+        if updated is None:
+            # No session row yet — create a cleared row so cooldowns can persist.
+            db.save_scraper_session(
+                PLATFORM,
+                [],
+                metadata={
+                    "source": "error_email_cooldown",
+                    "session_state": "cleared",
+                    "cookie_count": 0,
+                    "error_email_cooldowns": cooldowns,
+                },
+            )
+    except Exception as exc:
+        print(f"  WARNING: could not persist error-email cooldown: {_redact(exc)}")
+
+
 def send_error_email(
     context: str,
     error,
@@ -1573,7 +1731,11 @@ def send_error_email(
     if not force:
         cooldown_s = max(Config.ERROR_EMAIL_COOLDOWN_MINUTES, 0) * 60
         last = _error_email_last_sent.get(fingerprint)
-        if last is not None and (time.time() - last) < cooldown_s:
+        if last is None:
+            last = _load_persistent_error_cooldowns().get(fingerprint)
+            if last is not None:
+                _error_email_last_sent[fingerprint] = float(last)
+        if last is not None and (time.time() - float(last)) < cooldown_s:
             print(f"  ⏳ Error email for '{context}' suppressed (cooldown active)")
             return False
 
@@ -1681,7 +1843,9 @@ def send_error_email(
     try:
         result = send_email_with_retry(msg, label=f"error:{context}")
         if result.get("success"):
-            _error_email_last_sent[fingerprint] = time.time()
+            sent_at = time.time()
+            _error_email_last_sent[fingerprint] = sent_at
+            _save_persistent_error_cooldown(fingerprint, sent_at)
             print(f"  📧 Error email sent to {Config.ERROR_RECIPIENT}")
             return True
         # Do NOT call send_error_email again — recursion guard + log only.
@@ -2457,12 +2621,7 @@ def _cmd_run_monitor(*, run_once: bool, test_details: bool, dry_run: bool, debug
                 "❌ Failed to establish a session. Check movemeon_login_failed.png/html "
                 "or cookie_session_failed.png/html on the server."
             )
-            send_error_email(
-                "Session Setup Failed",
-                "Could not establish MoveMeOn session",
-                details="Initial session setup failed on startup. Browser cookies or login may be stale.",
-                operation="Establish MoveMeOn session",
-            )
+            # perform_login already sent the Login Failed alert (with cooldown).
             return 1
 
         check_count = 0

@@ -1487,18 +1487,31 @@ def save_scraper_session(
     if safe_local_storage:
         session_data["local_storage"] = safe_local_storage
 
+    client = get_supabase_client()
+    existing = load_scraper_session(normalized_platform)
+    existing_meta = (
+        existing.get("metadata")
+        if existing and isinstance(existing.get("metadata"), dict)
+        else {}
+    )
+    meta = dict(metadata) if isinstance(metadata, dict) else {
+        "cookie_count": len(safe_cookies),
+        "source": "selenium",
+        "session_state": "active" if safe_cookies else "cleared",
+        "last_validated_at": now,
+    }
+    # Preserve alert cooldowns across normal cookie saves.
+    if "error_email_cooldowns" not in meta and isinstance(
+        existing_meta.get("error_email_cooldowns"), dict
+    ):
+        meta["error_email_cooldowns"] = existing_meta["error_email_cooldowns"]
+
     session_payload = {
         "session_data": session_data,
         "saved_at": now,
         "expires_at": _earliest_cookie_expiry(safe_cookies),
         "session_version": 1,
-        "metadata": metadata
-        or {
-            "cookie_count": len(safe_cookies),
-            "source": "selenium",
-            "session_state": "active" if safe_cookies else "cleared",
-            "last_validated_at": now,
-        },
+        "metadata": meta,
     }
     # Never include worker-lock columns in cookie payloads.
     for forbidden in (
@@ -1509,8 +1522,6 @@ def save_scraper_session(
         session_payload.pop(forbidden, None)
     _assert_session_write_contract(session_payload, operation="save_scraper_session")
 
-    client = get_supabase_client()
-    existing = load_scraper_session(normalized_platform)
     if existing:
         response = _execute(
             "save_scraper_session",
@@ -1575,31 +1586,38 @@ def delete_scraper_session(platform: str) -> bool:
 
     Idempotent. Never deletes the scraper_sessions row. Never sends saved_at=NULL
     (column is NOT NULL). Marks the cleared session as immediately expired.
+    Preserves metadata.error_email_cooldowns across clears.
     """
     if not platform:
         raise ValueError("platform is required")
     normalized_platform = platform.strip().lower()
     now = _iso()
-    payload = {
-        "session_data": {"cookies": []},
-        "saved_at": now,
-        "expires_at": now,
-        "metadata": {
-            "source": "selenium",
-            "session_state": "cleared",
-            "cleared_at": now,
-            "cookie_count": 0,
-        },
-    }
-    _assert_session_write_contract(payload, operation="delete_scraper_session")
 
-    client = get_supabase_client()
     existing = load_scraper_session(normalized_platform)
     if not existing:
         # Missing row is idempotent success for cookie clear.
         return True
 
-    # Already-cleared empty cookie list is still a successful no-op update.
+    # Preserve operational alert cooldowns across cookie clears / process restarts.
+    existing_meta = existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {}
+    preserved_cooldowns = existing_meta.get("error_email_cooldowns")
+    metadata = {
+        "source": "selenium",
+        "session_state": "cleared",
+        "cleared_at": now,
+        "cookie_count": 0,
+    }
+    if isinstance(preserved_cooldowns, dict) and preserved_cooldowns:
+        metadata["error_email_cooldowns"] = preserved_cooldowns
+    payload = {
+        "session_data": {"cookies": []},
+        "saved_at": now,
+        "expires_at": now,
+        "metadata": metadata,
+    }
+    _assert_session_write_contract(payload, operation="delete_scraper_session")
+
+    client = get_supabase_client()
     try:
         response = _execute(
             "delete_scraper_session",
@@ -1620,6 +1638,31 @@ def delete_scraper_session(platform: str) -> bool:
             f"operation=delete_scraper_session table=scraper_sessions "
             f"platform={normalized_platform}: {redact_db_error(exc)}"
         ) from exc
+
+
+def merge_scraper_session_metadata(platform: str, patch: dict) -> Optional[dict]:
+    """Merge keys into scraper_sessions.metadata without touching cookie/lock columns."""
+    if not platform:
+        raise ValueError("platform is required")
+    if not isinstance(patch, dict) or not patch:
+        return load_scraper_session(platform)
+    normalized_platform = platform.strip().lower()
+    existing = load_scraper_session(normalized_platform)
+    if not existing:
+        return None
+    meta = dict(existing.get("metadata") or {})
+    meta.update(patch)
+    client = get_supabase_client()
+    response = _execute(
+        "merge_scraper_session_metadata",
+        "scraper_sessions",
+        client.table("scraper_sessions")
+        .update({"metadata": meta})
+        .eq("platform", normalized_platform)
+        .select("*"),
+        platform=normalized_platform,
+    )
+    return _one(response, required=False)
 
 
 def test_session_cookie_clear(*, cleanup: bool = True) -> dict:
