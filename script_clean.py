@@ -2819,33 +2819,6 @@ def _cmd_run_monitor(*, run_once: bool, test_details: bool, dry_run: bool, debug
             print(f"WORKER LOCK ERROR: {exc}")
             return 1
 
-        try:
-            driver = initialize_driver()
-        except Exception as init_exc:
-            print(f"❌ Browser/ChromeDriver initialization failed: {_redact(init_exc)}")
-            send_error_email(
-                "Browser Initialization Failed",
-                init_exc,
-                operation="Initialize ChromeDriver",
-                traceback_text=traceback.format_exc(),
-            )
-            return 1
-        if not setup_session(driver):
-            print(
-                "❌ Failed to establish a session. Check movemeon_login_failed.png/html "
-                "or cookie_session_failed.png/html on the server."
-            )
-            # Release before the delay so a replacement replica can start.
-            lock.release()
-            delay = max(int(Config.SESSION_FAIL_EXIT_DELAY_SECONDS), 0)
-            if delay:
-                print(
-                    f"  Waiting {delay}s before exit to avoid Railway crash-loop / alert spam..."
-                )
-                time.sleep(delay)
-            # perform_login already sent the Login Failed alert (with cooldown).
-            return 1
-
         check_count = 0
         while True:
             lock.maybe_renew()
@@ -2854,19 +2827,34 @@ def _cmd_run_monitor(*, run_once: bool, test_details: bool, dry_run: bool, debug
             print(f"🔄 Check #{check_count} - {datetime.now(PKT).strftime('%Y-%m-%d %H:%M:%S')} PKT")
             print("=" * 30)
 
-            # Fresh Chrome each scheduled day after the first — overnight memory
-            # growth is the usual cause of "tab crashed".
-            if check_count > 1:
+            # Start Chrome only for this scan. It is quit after success so Railway
+            # does not pay ~1GB RAM during the ~24h sleep until the next run.
+            if driver is None:
                 try:
-                    driver = recreate_browser_session(driver)
-                except Exception as rec_exc:
-                    print(f"❌ Could not recreate Chrome before scan: {_redact(rec_exc)}")
+                    driver = initialize_driver()
+                except Exception as init_exc:
+                    print(f"❌ Browser/ChromeDriver initialization failed: {_redact(init_exc)}")
                     send_error_email(
-                        "Chrome Recreate Failed",
-                        rec_exc,
-                        details="Pre-scan browser restart failed",
-                        operation="Recreate Chrome before daily scan",
+                        "Browser Initialization Failed",
+                        init_exc,
+                        operation="Initialize ChromeDriver",
+                        traceback_text=traceback.format_exc(),
                     )
+                    return 1
+                if not setup_session(driver):
+                    print(
+                        "❌ Failed to establish a session. Check movemeon_login_failed.png/html "
+                        "or cookie_session_failed.png/html on the server."
+                    )
+                    # Release before the delay so a replacement replica can start.
+                    lock.release()
+                    delay = max(int(Config.SESSION_FAIL_EXIT_DELAY_SECONDS), 0)
+                    if delay:
+                        print(
+                            f"  Waiting {delay}s before exit to avoid Railway crash-loop / alert spam..."
+                        )
+                        time.sleep(delay)
+                    # perform_login already sent the Login Failed alert (with cooldown).
                     return 1
 
             max_attempts = max(int(Config.SCAN_CRASH_MAX_RETRIES), 1)
@@ -2943,6 +2931,11 @@ def _cmd_run_monitor(*, run_once: bool, test_details: bool, dry_run: bool, debug
                         operation="Scheduled worker run",
                     )
                 return 1
+
+            # Free Chromium RAM while waiting for the next scheduled day.
+            print("  Quitting Chrome until next scheduled run (saves Railway RAM)...")
+            _safe_quit_driver(driver)
+            driver = None
 
             lock.maybe_renew()
             sleep_until_next_run()

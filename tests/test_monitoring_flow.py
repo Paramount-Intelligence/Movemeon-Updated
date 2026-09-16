@@ -218,6 +218,7 @@ class BrowserCrashRecoveryTests(unittest.TestCase):
              mock.patch.object(sc, "setup_session", return_value=True), \
              mock.patch.object(sc, "run_scrape_cycle", side_effect=fake_scan), \
              mock.patch.object(sc, "recreate_browser_session", return_value=fake_driver) as mock_recreate, \
+             mock.patch.object(sc, "_safe_quit_driver") as mock_quit, \
              mock.patch.object(sc, "sleep_until_next_run", side_effect=KeyboardInterrupt), \
              mock.patch.object(sc, "send_error_email", return_value=True), \
              mock.patch.object(sc.Config, "SCAN_CRASH_MAX_RETRIES", 3), \
@@ -230,6 +231,35 @@ class BrowserCrashRecoveryTests(unittest.TestCase):
 
         self.assertEqual(calls["scan"], 2)
         self.assertTrue(mock_recreate.called)
+        # Chrome must be closed before the ~24h sleep to free Railway RAM.
+        self.assertTrue(mock_quit.called)
+
+    def test_cmd_run_monitor_quits_chrome_before_daily_sleep(self):
+        fake_driver = mock.MagicMock()
+        init_calls = {"n": 0}
+
+        def fake_init():
+            init_calls["n"] += 1
+            return fake_driver
+
+        with mock.patch.object(sc, "start_health_server"), \
+             mock.patch.object(sc.WorkerLockGuard, "acquire"), \
+             mock.patch.object(sc.WorkerLockGuard, "maybe_renew", return_value=True), \
+             mock.patch.object(sc.WorkerLockGuard, "release"), \
+             mock.patch.object(sc, "initialize_driver", side_effect=fake_init), \
+             mock.patch.object(sc, "setup_session", return_value=True) as mock_setup, \
+             mock.patch.object(sc, "run_scrape_cycle"), \
+             mock.patch.object(sc, "_safe_quit_driver") as mock_quit, \
+             mock.patch.object(sc, "sleep_until_next_run", side_effect=KeyboardInterrupt), \
+             mock.patch.object(sc, "send_error_email", return_value=True):
+            with self.assertRaises(KeyboardInterrupt):
+                sc._cmd_run_monitor(
+                    run_once=False, test_details=False, dry_run=True, debug_extraction=False
+                )
+
+        self.assertEqual(init_calls["n"], 1)
+        self.assertEqual(mock_setup.call_count, 1)
+        self.assertGreaterEqual(mock_quit.call_count, 1)
 
     def test_cmd_run_monitor_run_once_does_not_sleep_after_crash_retry_success(self):
         crash = Exception("Message: tab crashed")
